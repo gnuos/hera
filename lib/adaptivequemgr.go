@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"math/rand"
 	"sync/atomic"
+	"strings"
 	"time"
 
 	"github.com/paypal/hera/cal"
@@ -117,6 +118,22 @@ type BindCount struct {
 	Workers map[string]*WorkerClient // lookup by ticket
 }
 
+func bindEvictNameOk(bindName string) (bool) {
+	commaNames := GetConfig().BindEvictionNames
+	if len(commaNames) == 0 {
+		// for tests, allow all names to be subject to bind eviction
+		return true
+	}
+	commaNames = strings.ToLower(commaNames)
+	bindName = strings.ToLower(bindName)
+	for _, okSubname := range strings.Split(commaNames,",") {
+		if strings.Contains(bindName, okSubname) {
+			return true
+		}
+	}
+	return false
+}
+
 /* A bad query with multiple binds will add independent bind throttles to all
 bind name and values */
 func (mgr *adaptiveQueueManager) doBindEviction() (int) {
@@ -132,6 +149,8 @@ func (mgr *adaptiveQueueManager) doBindEviction() (int) {
 	}
 
 	bindCounts := make(map[string]*BindCount)
+	mgr.wpool.poolCond.L.Lock()
+	defer mgr.wpool.poolCond.L.Unlock()
 	for worker, ticket := range mgr.dispatchedWorkers {
 		if worker == nil {
 			continue
@@ -142,7 +161,13 @@ func (mgr *adaptiveQueueManager) doBindEviction() (int) {
 		if ok {
 			continue // don't repeatedly bind evict something already evicted
 		}
-		request := worker.sqlBindNs.Load().(*netstring.Netstring)
+		request, ok := worker.sqlBindNs.Load().(*netstring.Netstring)
+		if !ok {
+			if logger.GetLogger().V(logger.Alert) {
+				logger.GetLogger().Log(logger.Alert, "bad req netstring, skipping bind evict eval, pid", worker.pid)
+			}
+			continue
+		}
 		contextBinds := parseBinds(request)
 		for bindName0, bindValue := range contextBinds {
 			/* avoid too short status values
@@ -158,7 +183,10 @@ func (mgr *adaptiveQueueManager) doBindEviction() (int) {
 			bind names are all normalized to bn#
 			bind values may repeat */
 			bindName := NormalizeBindName(bindName0)
-			concatKey := fmt.Sprintf("%u|%s|%s", sqlhash, bindName, bindValue)
+			if !bindEvictNameOk(bindName) {
+				continue
+			}
+			concatKey := fmt.Sprintf("%d|%s|%s", sqlhash, bindName, bindValue)
 
 			entry, ok := bindCounts[concatKey]
 			if !ok {
@@ -177,13 +205,14 @@ func (mgr *adaptiveQueueManager) doBindEviction() (int) {
 
 	evictedTicket := make(map[string]string)
 
+	numDispatchedWorkers := len(mgr.dispatchedWorkers)
 	evictCount := 0
 	for _, entry := range bindCounts {
 		sqlhash := entry.Sqlhash
 		bindName := entry.Name
 		bindValue := entry.Value
 
-		if len(entry.Workers) < int( float64(GetConfig().BindEvictionThresholdPct)/100.*float64(len(mgr.dispatchedWorkers)) ) {
+		if len(entry.Workers) < int( float64(GetConfig().BindEvictionThresholdPct)/100.*float64(numDispatchedWorkers) ) {
 			continue
 		}
 		// evict sqlhash, bindvalue
@@ -195,9 +224,13 @@ func (mgr *adaptiveQueueManager) doBindEviction() (int) {
 			}
 			evictedTicket[ticket] = ticket
 
-			if mgr.dispatchedWorkers[worker] != ticket {
+			if mgr.dispatchedWorkers[worker] != ticket ||
+				worker.Status == wsFnsh ||
+				worker.isUnderRecovery == 1 /* Recover() uses compare & swap */ {
+
 				continue
 			}
+
 			// do eviction
 			select {
 			case worker.ctrlCh <- &workerMsg{data: nil, free: false, abort: true, bindEvict: true}:

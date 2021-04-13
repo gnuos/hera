@@ -295,6 +295,16 @@ func (crd *Coordinator) Run() {
 	// if coordinator has to bail out, we need to inform requesthandler the same
 	// by close the client connection. this way requesthandler gets EOF from client
 	//
+	if crd.worker != nil { // for a client disconn
+		et := cal.NewCalEvent("HERAMUX", "CATCH_CLIENT_DROP_FREE_WORKER", cal.TransOK, "")
+		et.AddDataStr("raddr", crd.conn.RemoteAddr().String())
+		et.AddDataStr("worker_pid", fmt.Sprintf("%d",crd.worker.pid))
+		et.Completed()
+
+		GetStateLog().PublishStateEvent(StateEvent{eType: ConnStateEvt, shardID: crd.worker.shardID, wType: crd.worker.Type, instID: crd.worker.instID, oldCState: Assign, newCState: Idle})
+		go crd.worker.Recover(crd.workerpool, crd.ticket, &strandedCalInfo{raddr: crd.conn.RemoteAddr().String(), laddr: crd.conn.LocalAddr().String()})
+		crd.resetWorkerInfo()
+	}
 	if logger.GetLogger().V(logger.Debug) {
 		logger.GetLogger().Log(logger.Debug, crd.id, "Coordinator exiting ...")
 	}
@@ -806,6 +816,11 @@ func (crd *Coordinator) doRequest(ctx context.Context, worker *WorkerClient, req
 			logger.GetLogger().Log(logger.Verbose, crd.id, "coordinator dorequest: exiting")
 		}
 	}()
+
+	now := time.Now().UnixNano()
+	timesincestart := uint32((now - GetStateLog().GetStartTime()) / int64(time.Millisecond))
+	atomic.StoreUint32(&(worker.sqlStartTimeMs), timesincestart)
+
 	if request != nil {
 		_/*isPrepare*/, isCommit, isRollback, parseErr := crd.parseCmd(request)
 		if parseErr != nil {
@@ -853,16 +868,6 @@ func (crd *Coordinator) doRequest(ctx context.Context, worker *WorkerClient, req
 		timesincestart := uint32(0)
 		if isCommit || isRollback { // set the sqlStartTimeMs to 0 to avoid recover routine to pick during saturation for OCC_COMMIT and OCC_ROLLBACK
 			atomic.StoreUint32(&(worker.sqlStartTimeMs), 0)
-		} else {
-			//
-			// the assumption is each dosession deals with a single sql. if not, uncomment the sqlhash
-			// extraction code in workerclient to reset worker.sqlHash on each prepare inside one
-			// dosession.
-			//
-			atomic.StoreInt32(&(worker.sqlHash), crd.sqlhash)
-			now := time.Now().UnixNano()
-			timesincestart = uint32((now - GetStateLog().GetStartTime()) / int64(time.Millisecond))
-			atomic.StoreUint32(&(worker.sqlStartTimeMs), timesincestart)
 		}
 		if logger.GetLogger().V(logger.Debug) {
 			logger.GetLogger().Log(logger.Debug, "worker pid:", worker.pid, "crd sqlhash =", uint32(worker.sqlHash), "sqltime=", timesincestart)
@@ -876,9 +881,6 @@ func (crd *Coordinator) doRequest(ctx context.Context, worker *WorkerClient, req
 	//
 	atomic.StoreInt32(&(worker.sqlHash), crd.sqlhash)
 	worker.sqlBindNs.Store(request)
-	now := time.Now().UnixNano()
-	timesincestart := uint32((now - GetStateLog().GetStartTime()) / int64(time.Millisecond))
-	atomic.StoreUint32(&(worker.sqlStartTimeMs), timesincestart)
 	if logger.GetLogger().V(logger.Debug) {
 		logger.GetLogger().Log(logger.Debug, crd.id, "crd sqlhash =", uint32(worker.sqlHash), "sqltime=", timesincestart)
 	}
@@ -1096,6 +1098,7 @@ func (crd *Coordinator) processError(err error) {
 	//
 	if (err == ErrBklgTimeout) ||
 		(err == ErrBklgEviction) ||
+		(err == ErrBindEviction) ||
 		(err == ErrRejectDbDown) ||
 		(err == ErrSaturationKill) ||
 		(err == ErrSaturationSoftSQLEviction) {

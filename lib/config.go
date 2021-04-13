@@ -20,12 +20,12 @@ package lib
 import (
 	"errors"
 	"fmt"
-	"strings"
-	"sync/atomic"
-	"path/filepath"
-	"os"
 	"github.com/paypal/hera/config"
 	"github.com/paypal/hera/utility/logger"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync/atomic"
 )
 
 //The Config contains all the static configuration
@@ -52,6 +52,7 @@ type Config struct {
 	BindEvictionTargetConnPct   int
 	BindEvictionThresholdPct    int
 	BindEvictionDecrPerSec      float64
+	BindEvictionNames           string
 	BindEvictionMaxThrottle     int
 	//
 	//
@@ -84,14 +85,14 @@ type Config struct {
 	//
 	// @TODO need a function for cdb boolean
 	//
-	DatabaseType      dbtype
-	EnableSharding    bool
-	UseShardMap       bool
-	NumOfShards       int
-	ShardKeyName      string
-	MaxScuttleBuckets int
-	ScuttleColName    string
-	ShardingAlgoHash  bool
+	DatabaseType              dbtype
+	EnableSharding            bool
+	UseShardMap               bool
+	NumOfShards               int
+	ShardKeyName              string
+	MaxScuttleBuckets         int
+	ScuttleColName            string
+	ShardingAlgoHash          bool
 	ShardKeyValueTypeIsString bool
 
 	EnableWhitelistTest       bool
@@ -124,8 +125,8 @@ type Config struct {
 	// to use OpenSSL (for testing) or crypto/tls
 	UseOpenSSL bool
 
-	ErrorCodePrefix string
-	StateLogPrefix string
+	ErrorCodePrefix       string
+	StateLogPrefix        string
 	ManagementTablePrefix string
 	// RAC maint reload config interval
 	RacMaintReloadInterval int
@@ -151,6 +152,12 @@ type Config struct {
 	EnableDanglingWorkerRecovery bool
 
 	GoStatsInterval int
+
+	// The max number of database connections to be established per second
+	MaxDbConnectsPerSec int
+
+	// Max desired percentage of healthy workers for the worker pool
+	MaxDesiredHealthyWorkerPct int
 }
 
 // The OpsConfig contains the configuration that can be modified during run time
@@ -197,13 +204,13 @@ func parseMapStrStr(encoded string) map[string]string {
 func InitConfig() error {
 	currentDir, abserr := filepath.Abs(filepath.Dir(os.Args[0]))
 
-	if (abserr != nil) {
-		currentDir = "./" 
+	if abserr != nil {
+		currentDir = "./"
 	} else {
 		currentDir = currentDir + "/"
 	}
 
-	filename := currentDir + "hera.txt" 
+	filename := currentDir + "hera.txt"
 
 	cdb, err := config.NewTxtConfig(filename)
 	if err != nil {
@@ -213,9 +220,9 @@ func InitConfig() error {
 	gAppConfig = &Config{numWorkersCh: make(chan int, 1)}
 
 	logFile := cdb.GetOrDefaultString("log_file", "hera.log")
-	logFile = currentDir + logFile 
+	logFile = currentDir + logFile
 	logLevel := cdb.GetOrDefaultInt("log_level", logger.Info)
-	
+
 	err = logger.CreateLogger(logFile, "PROXY", int32(logLevel))
 	if err != nil {
 		FullShutdown()
@@ -380,6 +387,7 @@ func InitConfig() error {
 	gAppConfig.SoftEvictionProbability = cdb.GetOrDefaultInt("soft_eviction_probability", 50)
 	gAppConfig.BindEvictionTargetConnPct = cdb.GetOrDefaultInt("bind_eviction_target_conn_pct", 50)
 	gAppConfig.BindEvictionMaxThrottle = cdb.GetOrDefaultInt("bind_eviction_max_throttle", 20)
+	gAppConfig.BindEvictionNames = cdb.GetOrDefaultString("bind_eviction_names", "id,num")
 	gAppConfig.BindEvictionThresholdPct = cdb.GetOrDefaultInt("bind_eviction_threshold_pct", 25)
 	fmt.Sscanf(cdb.GetOrDefaultString("bind_eviction_decr_per_sec", "1.0"),
 		"%f", &gAppConfig.BindEvictionDecrPerSec)
@@ -405,6 +413,15 @@ func InitConfig() error {
 	gAppConfig.EnableDanglingWorkerRecovery = cdb.GetOrDefaultBool("enable_danglingworker_recovery", false)
 
 	gAppConfig.GoStatsInterval = cdb.GetOrDefaultInt("go_stats_interval", 10)
+	defaultConns := 10000 // disable by default
+	if gAppConfig.EnableTAF {
+		defaultConns = 5
+	}
+	gAppConfig.MaxDbConnectsPerSec = cdb.GetOrDefaultInt("max_db_connects_per_sec", defaultConns)
+	gAppConfig.MaxDesiredHealthyWorkerPct = cdb.GetOrDefaultInt("max_desire_healthy_worker_pct", 90)
+	if gAppConfig.MaxDesiredHealthyWorkerPct > 100 {
+		gAppConfig.MaxDesiredHealthyWorkerPct = 90
+	}
 
 	return nil
 }
